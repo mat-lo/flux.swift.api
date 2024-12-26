@@ -12,7 +12,68 @@ import CoreGraphics
 import UniformTypeIdentifiers
 import ImageIO
 
-// Copy the Image struct from the original code
+// MARK: - Models
+struct GenerateImageRequest: Content {
+    var prompt: String
+    var width: Int?
+    var height: Int?
+    var steps: Int?
+    
+    // Helper properties to get final values
+    var finalWidth: Int { width ?? 512 }
+    var finalHeight: Int { height ?? 512 }
+    var finalSteps: Int { steps ?? 4 }
+}
+
+struct JobResponse: Content {
+    let jobId: String
+}
+
+struct JobStatusResponse: Content {
+    let status: String
+    let progress: Int
+    let imagePath: String?
+    let error: String?
+    let prompt: String?
+    let width: Int?
+    let height: Int?
+    let steps: Int?
+}
+
+// MARK: - Job Status
+struct JobStatus {
+    enum Status {
+        case inProgress(progress: Int)
+        case completed(imagePath: String)
+        case failed(error: String)
+    }
+    
+    let status: Status
+    let request: GenerateImageRequest
+}
+
+// MARK: - Job Storage
+actor JobStorage {
+    private var jobs: [String: JobStatus] = [:]
+    
+    func createJob(id: String, status: JobStatus.Status, request: GenerateImageRequest) {
+        jobs[id] = JobStatus(status: status, request: request)
+    }
+    
+    func updateJob(id: String, status: JobStatus.Status, request: GenerateImageRequest) {
+        jobs[id] = JobStatus(status: status, request: request)
+    }
+    
+    func getJob(id: String) -> JobStatus? {
+        return jobs[id]
+    }
+    
+    func cleanupJob(id: String) {
+        jobs.removeValue(forKey: id)
+    }
+}
+
+// MARK: - Image Processing
 enum ImageError: Error {
     case failedToSave
     case unableToOpen
@@ -32,7 +93,6 @@ public struct Image {
         else {
             throw ImageError.unableToOpen
         }
-
         self.init(image: image)
     }
 
@@ -110,7 +170,7 @@ public struct Image {
 
     public func save(url: URL) throws {
         let uti = UTType(filenameExtension: url.pathExtension) ?? UTType.png
-
+        
         guard let destination = CGImageDestinationCreateWithURL(
             url as CFURL, uti.identifier as CFString, 1, nil)
         else {
@@ -124,136 +184,218 @@ public struct Image {
     }
 }
 
-struct GenerateImageRequest: Content {
-    var prompt: String
-    
-    var width: Int?
-    var height: Int?
-    var steps: Int?
-    var guidance: Float?
-    var model: String?
-    var hfToken: String?
-    var seed: UInt64?
-    var quantize: Bool?
-    var float16: Bool?
-    var loraPath: String?
-    var initImagePath: String?
-    var initImageStrength: Float?
-    
-    var finalWidth: Int { width ?? 512 }
-    var finalHeight: Int { height ?? 512 }
-    var finalSteps: Int { steps ?? 4 }
-    var finalGuidance: Float { guidance ?? 3.5 }
-    var finalModel: String { model?.lowercased() ?? "schnell" }
-    var finalQuantize: Bool { quantize ?? false }
-    var finalFloat16: Bool { float16 ?? true }
-}
-
-func routes(_ app: Application) throws {
-    app.post("generate") { req async throws -> Response in
-        let request = try req.content.decode(GenerateImageRequest.self)
-        
-        // Set up model configuration
-        let selectedModel: FluxConfiguration
-        var token: String?
-        let defaultTokenLocation = NSString("~/.cache/huggingface/token").expandingTildeInPath
-        
-        switch request.finalModel {
-        case "schnell":
-            selectedModel = FluxConfiguration.flux1Schnell
-        case "dev":
-            selectedModel = FluxConfiguration.flux1Dev
-            token = request.hfToken
-            
-            if token == nil {
-                token = try? String(contentsOfFile: defaultTokenLocation, encoding: .utf8)
-                req.logger.info("Using default Hugging Face token from \(defaultTokenLocation)")
-            }
-        default:
-            throw Abort(.badRequest, reason: "Invalid model type. Please choose 'schnell' or 'dev'.")
-        }
-        
-        // Download model
-        req.logger.info("Downloading or loading model...")
-        try await selectedModel.download(hub: request.finalModel == "dev" ? HubApi(hfToken: token) : HubApi())
-        
-        let loadConfiguration = LoadConfiguration(
-            float16: request.finalFloat16,
-            quantize: request.finalQuantize,
-            loraPath: request.loraPath
-        )
-        
-        // Handle LoRA weights if specified
-        if let loraPath = loadConfiguration.loraPath {
-            if !FileManager.default.fileExists(atPath: loraPath) {
-                req.logger.info("Downloading LoRA weights...")
-                try await selectedModel.downloadLoraWeights(loadConfiguration: loadConfiguration)
-            }
-        }
-        
-        // Set up generator and parameters
-        let generator: ImageGenerator?
-        var denoiser: DenoiseIterator?
-        
-        let parameters = EvaluateParameters(
-            width: request.finalWidth,
-            height: request.finalHeight,
-            numInferenceSteps: request.finalSteps,
-            guidance: request.finalGuidance,
-            seed: request.seed,
-            prompt: request.prompt,
-            shiftSigmas: request.finalModel == "dev"
-        )
-        
-        req.logger.info("Initializing generator...")
-        generator = try selectedModel.textToImageGenerator(configuration: loadConfiguration)
-        generator?.ensureLoaded()
-        denoiser = (generator as? TextToImageGenerator)?.generateLatents(parameters: parameters)
-        
-        // Generate image
-        req.logger.info("Starting image generation...")
-        var lastXt: MLXArray!
-        while let xt = denoiser!.next() {
-            req.logger.info("Step \(denoiser!.i)/\(parameters.numInferenceSteps)")
-            eval(xt)
-            lastXt = xt
-        }
-        
-        // Process generated image
-        req.logger.info("Processing generated image...")
-        let unpackedLatents = unpackLatents(lastXt, height: parameters.height, width: parameters.width)
-        let decoded = generator?.decode(xt: unpackedLatents)
-        let imageData = decoded?.squeezed()
-        let raster = (imageData! * 255).asType(.uint8)
-        
-        // Create Image instance
-        let image = Image(raster)
-        
-        // Create temporary file and save the image
-        let tempDir = FileManager.default.temporaryDirectory
-        let tempFile = tempDir.appendingPathComponent(UUID().uuidString + ".png")
-        
-        // Save image to temporary file
-        try image.save(url: tempFile)
-        
-        // Read the PNG file
-        let pngData = try Data(contentsOf: tempFile)
-        
-        // Clean up
-        try? FileManager.default.removeItem(at: tempFile)
-        
-        // Create response
-        req.logger.info("Sending response...")
-        let response = Response(status: .ok)
-        response.headers.contentType = .png
-        response.body = .init(data: pngData)
-        return response
+// MARK: - Helper Functions
+func calculateProgress(currentStep: Int, totalSteps: Int) -> Int {
+    switch currentStep {
+        case 0: return 0
+        case 1: return 25
+        case 2: return 50
+        case 3: return 75
+        case totalSteps: return 100
+        default: return min(Int((Float(currentStep) / Float(totalSteps)) * 100), 100)
     }
 }
 
-// Helper function for unpacking latents
 private func unpackLatents(_ latents: MLXArray, height: Int, width: Int) -> MLXArray {
     let reshaped = latents.reshaped(1, height / 16, width / 16, 16, 2, 2)
     let transposed = reshaped.transposed(0, 1, 4, 2, 5, 3)
     return transposed.reshaped(1, height / 16 * 2, width / 16 * 2, 16)
+}
+
+// Global job storage
+let jobStorage = JobStorage()
+
+// MARK: - Routes
+func routes(_ app: Application) throws {
+    // Get the absolute path to the Public directory
+    let workingDirectory = DirectoryConfiguration.detect().workingDirectory
+    let publicPath = workingDirectory + "Public/"
+    let imagesPath = publicPath + "images/"
+    
+    // Ensure images directory exists
+    let fileManager = FileManager.default
+    if !fileManager.fileExists(atPath: imagesPath) {
+        try fileManager.createDirectory(atPath: imagesPath, withIntermediateDirectories: true)
+    }
+    
+    app.logger.info("Images will be saved to: \(imagesPath)")
+    
+    // MARK: Generate endpoint
+    app.post("generate") { req async throws -> JobResponse in
+        let request = try req.content.decode(GenerateImageRequest.self)
+        let jobId = UUID().uuidString
+        
+        req.logger.info("Received request: prompt='\(request.prompt)', width=\(request.finalWidth), height=\(request.finalHeight), steps=\(request.finalSteps)")
+        
+        // Create job entry
+        await jobStorage.createJob(id: jobId, status: .inProgress(progress: 0), request: request)
+        
+        Task {
+            do {
+                // Set up model configuration
+                let selectedModel = FluxConfiguration.flux1Schnell
+                
+                // Download model
+                req.logger.info("Downloading or loading model...")
+                try await selectedModel.download(hub: HubApi())
+                
+                let loadConfiguration = LoadConfiguration(
+                    float16: true,
+                    quantize: false,
+                    loraPath: nil
+                )
+                
+                // Set up generator and parameters
+                let parameters = EvaluateParameters(
+                                    width: request.finalWidth,
+                                    height: request.finalHeight,
+                                    numInferenceSteps: request.finalSteps,
+                                    guidance: 3.5,
+                                    seed: nil,
+                                    prompt: request.prompt,
+                                    shiftSigmas: false
+                                )
+                                
+                                req.logger.info("Initializing generator...")
+                                guard var generator = try selectedModel.textToImageGenerator(configuration: loadConfiguration) else {
+                                    throw Abort(.internalServerError, reason: "Failed to create generator")
+                                }
+                                
+                                generator.ensureLoaded()
+                                guard var denoiser = (generator as? TextToImageGenerator)?.generateLatents(parameters: parameters) else {
+                                    throw Abort(.internalServerError, reason: "Failed to create denoiser")
+                                }
+                                
+                                // Generate image
+                req.logger.info("Starting image generation...")
+                                var step = 0
+                                var lastXt: MLXArray!
+                                
+                                while let xt = denoiser.next() {
+                                    step += 1
+                                    let progress = calculateProgress(currentStep: step, totalSteps: parameters.numInferenceSteps)
+                                    await jobStorage.updateJob(
+                                        id: jobId,
+                                        status: .inProgress(progress: progress),
+                                        request: request
+                                    )
+                                    req.logger.info("Step \(step)/\(parameters.numInferenceSteps) - Progress: \(progress)%")
+                                    eval(xt)
+                                    lastXt = xt
+                                }
+                                
+                // Process generated image
+                                req.logger.info("Processing generated image...")
+                                let unpackedLatents = unpackLatents(lastXt, height: parameters.height, width: parameters.width)
+                                let decoded = generator.decode(xt: unpackedLatents)
+                                let imageData = decoded.squeezed()
+                                let raster = (imageData * 255).asType(.uint8)
+                                
+                                // Create Image instance
+                                let image = Image(raster)
+                
+                // Save image
+                let imageName = jobId + ".png"
+                let imagePath = imagesPath + imageName
+                
+                req.logger.info("Saving image to: \(imagePath)")
+                try image.save(url: URL(fileURLWithPath: imagePath))
+                
+                req.logger.info("Image saved successfully")
+                await jobStorage.updateJob(
+                    id: jobId,
+                    status: .completed(imagePath: "images/" + imageName),
+                    request: request
+                )
+                
+                // Schedule cleanup
+                Task {
+                    try await Task.sleep(nanoseconds: 3600_000_000_000) // 1 hour
+                    try? FileManager.default.removeItem(atPath: imagePath)
+                    await jobStorage.cleanupJob(id: jobId)
+                }
+                
+            } catch {
+                req.logger.error("Error generating image: \(error)")
+                await jobStorage.updateJob(
+                    id: jobId,
+                    status: .failed(error: error.localizedDescription),
+                    request: request
+                )
+            }
+        }
+        
+        return JobResponse(jobId: jobId)
+    }
+    
+    // MARK: Status endpoint
+    app.get("status", ":jobId") { req async throws -> JobStatusResponse in
+        guard let jobId = req.parameters.get("jobId") else {
+            throw Abort(.badRequest, reason: "Job ID is required")
+        }
+        
+        guard let job = await jobStorage.getJob(id: jobId) else {
+            throw Abort(.notFound, reason: "Job not found")
+        }
+        
+        switch job.status {
+        case .inProgress(let progress):
+            return JobStatusResponse(
+                status: "in_progress",
+                progress: progress,
+                imagePath: nil,
+                error: nil,
+                prompt: job.request.prompt,
+                width: job.request.finalWidth,
+                height: job.request.finalHeight,
+                steps: job.request.finalSteps
+            )
+        case .completed(let imagePath):
+            return JobStatusResponse(
+                status: "completed",
+                progress: 100,
+                imagePath: imagePath,
+                error: nil,
+                prompt: job.request.prompt,
+                width: job.request.finalWidth,
+                height: job.request.finalHeight,
+                steps: job.request.finalSteps
+            )
+        case .failed(let error):
+            return JobStatusResponse(
+                status: "failed",
+                progress: 0,
+                imagePath: nil,
+                error: error,
+                prompt: job.request.prompt,
+                width: job.request.finalWidth,
+                height: job.request.finalHeight,
+                steps: job.request.finalSteps
+            )
+        }
+    }
+    
+    // MARK: Download endpoint
+    app.get("download", ":jobId") { req -> Response in
+        guard let jobId = req.parameters.get("jobId") else {
+            throw Abort(.badRequest, reason: "Job ID is required")
+        }
+        
+        let status = await jobStorage.getJob(id: jobId)
+        guard case .completed(let imagePath) = status?.status else {
+            throw Abort(.notFound, reason: "Image not found or job not completed")
+        }
+        
+        let fullPath = publicPath + imagePath
+        guard FileManager.default.fileExists(atPath: fullPath) else {
+            throw Abort(.notFound, reason: "Image file not found")
+        }
+        
+        let data = try Data(contentsOf: URL(fileURLWithPath: fullPath))
+        
+        let response = Response(status: .ok)
+        response.headers.contentType = .png
+        response.body = .init(data: data)
+        return response
+    }
 }
