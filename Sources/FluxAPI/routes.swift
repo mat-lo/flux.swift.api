@@ -12,6 +12,30 @@ import CoreGraphics
 import UniformTypeIdentifiers
 import ImageIO
 
+// MARK: - CORS Configuration
+public func configureCORS(_ app: Application) throws {
+    // Configure CORS middleware
+    let corsConfiguration = CORSMiddleware.Configuration(
+        allowedOrigin: .any(["http://localhost:5173"]),
+        allowedMethods: [.GET, .POST, .OPTIONS, .DELETE, .PATCH],
+        allowedHeaders: [
+            .accept,
+            .authorization,
+            .contentType,
+            .origin,
+            .xRequestedWith,
+            .userAgent,
+            .accessControlAllowOrigin
+        ]
+    )
+    
+    let cors = CORSMiddleware(configuration: corsConfiguration)
+    
+    // Use the CORS middleware
+    app.middleware.use(cors)
+}
+
+
 // MARK: - Models
 struct GenerateImageRequest: Content {
     var prompt: String
@@ -223,6 +247,25 @@ let jobStorage = JobStorage()
 
 // MARK: - Routes
 func routes(_ app: Application) throws {
+    
+    app.routes.defaultMaxBodySize = "50mb"
+    
+    // Configure CORS first
+    let corsConfiguration = CORSMiddleware.Configuration(
+        allowedOrigin: .any(["http://localhost:5173"]),
+        allowedMethods: [.GET, .POST, .OPTIONS, .DELETE, .PATCH],
+        allowedHeaders: [
+            .accept,
+            .authorization,
+            .contentType,
+            .origin,
+            .xRequestedWith,
+            .userAgent,
+            .accessControlAllowOrigin
+        ]
+    )
+    app.middleware.use(CORSMiddleware(configuration: corsConfiguration))
+    
     // Get the absolute path to the Public directory
     let workingDirectory = DirectoryConfiguration.detect().workingDirectory
     let publicPath = workingDirectory + "Public/"
