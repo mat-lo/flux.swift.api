@@ -18,11 +18,27 @@ struct GenerateImageRequest: Content {
     var width: Int?
     var height: Int?
     var steps: Int?
+    var initImagePath: String?
+    var initImageStrength: Float?
     
-    // Helper properties to get final values
-    var finalWidth: Int { width ?? 512 }
-    var finalHeight: Int { height ?? 512 }
-    var finalSteps: Int { steps ?? 4 }
+    // Helper properties with validation
+    var finalWidth: Int {
+        let w = width ?? 512
+        return w - (w % 64)  // Ensure it's a multiple of 64
+    }
+    
+    var finalHeight: Int {
+        let h = height ?? 512
+        return h - (h % 64)  // Ensure it's a multiple of 64
+    }
+    
+    var finalSteps: Int {
+        min(max(steps ?? 4, 1), 50)  // Clamp between 1 and 50
+    }
+    
+    var finalImageStrength: Float {
+        min(max(initImageStrength ?? 0.3, 0.0), 1.0)  // Clamp between 0 and 1
+    }
 }
 
 struct JobResponse: Content {
@@ -257,56 +273,152 @@ func routes(_ app: Application) throws {
                                 )
                                 
                                 req.logger.info("Initializing generator...")
-                                guard var generator = try selectedModel.textToImageGenerator(configuration: loadConfiguration) else {
-                                    throw Abort(.internalServerError, reason: "Failed to create generator")
+                                
+                                // Variable to store the final image
+                                let generatedImage: Image
+                                
+                if let initImagePath = request.initImagePath {
+                                    // Image-to-image generation
+                                    req.logger.info("Using image-to-image generation with reference image: \(initImagePath)")
+                                    guard var generator = try selectedModel.ImageToImageGenerator(configuration: loadConfiguration) else {
+                                        throw Abort(.internalServerError, reason: "Failed to create image-to-image generator")
+                                    }
+                                    
+                                    generator.ensureLoaded()
+                                    
+                                    // Ensure exact dimensions
+                                    let targetWidth = request.finalWidth
+                                    let targetHeight = request.finalHeight
+                                    
+                                    req.logger.info("Processing input image to exact dimensions: \(targetWidth)x\(targetHeight)")
+                                    
+                                    // Create a new Image struct for resizing
+                                    let sourceImage = try Image(url: URL(fileURLWithPath: initImagePath))
+                                    
+                                    // Create a context with exact dimensions
+                                    let cs = CGColorSpace(name: CGColorSpace.sRGB)!
+                                    var resizeRaster = Data(count: targetWidth * 4 * targetHeight)
+                                    resizeRaster.withUnsafeMutableBytes { ptr in
+                                        let context = CGContext(
+                                            data: ptr.baseAddress,
+                                            width: targetWidth,
+                                            height: targetHeight,
+                                            bitsPerComponent: 8,
+                                            bytesPerRow: targetWidth * 4,
+                                            space: cs,
+                                            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
+                                        )!
+                                        
+                                        // Draw the source image scaled to fit exactly
+                                        context.draw(
+                                            sourceImage.asCGImage(),
+                                            in: CGRect(x: 0, y: 0, width: targetWidth, height: targetHeight)
+                                        )
+                                    }
+                                    
+                                    // Create MLXArray with exact dimensions
+                                    let resizedData = MLXArray(resizeRaster, [targetHeight, targetWidth, 4], type: UInt8.self)[0..., 0..., ..<3]
+                                    let image = Image(resizedData)
+                                    
+                                    // Log the actual dimensions we got
+                                    let (H, W, C) = image.data.shape3
+                                    req.logger.info("Resized image dimensions: \(W)x\(H) with \(C) channels")
+                                    
+                                    // Convert to float and normalize
+                                    let input = (image.data.asType(.float32) / 255) * 2 - 1
+                                    
+                                    let strength = request.finalImageStrength
+                                    req.logger.info("Using image strength: \(strength)")
+                                    
+                                    guard var denoiser = (generator as? ImageToImageGenerator)?.generateLatents(
+                                        image: input,
+                                        parameters: parameters,
+                                        strength: strength
+                                    ) else {
+                                        throw Abort(.internalServerError, reason: "Failed to create image-to-image denoiser")
+                                    }
+                                    
+                                    // Generate image
+                                    req.logger.info("Starting image-to-image generation...")
+                                    var step = 0
+                                    var lastXt: MLXArray!
+                                    
+                                    while let xt = denoiser.next() {
+                                        step += 1
+                                        let progress = calculateProgress(currentStep: step, totalSteps: parameters.numInferenceSteps)
+                                        await jobStorage.updateJob(
+                                            id: jobId,
+                                            status: .inProgress(progress: progress),
+                                            request: request
+                                        )
+                                        req.logger.info("Step \(step)/\(parameters.numInferenceSteps) - Progress: \(progress)%")
+                                        eval(xt)
+                                        lastXt = xt
+                                    }
+                                    
+                                    // Process generated image
+                                    req.logger.info("Processing generated image...")
+                                    let unpackedLatents = unpackLatents(lastXt, height: parameters.height, width: parameters.width)
+                                    let decoded = generator.decode(xt: unpackedLatents)
+                                    let imageData = decoded.squeezed()
+                                    let raster = (imageData * 255).asType(.uint8)
+                                    
+                                    // Create Image instance
+                                    generatedImage = Image(raster)
+                                    
+                                } else {
+                                    // Text-to-image generation (existing code)
+                                    guard var generator = try selectedModel.textToImageGenerator(configuration: loadConfiguration) else {
+                                        throw Abort(.internalServerError, reason: "Failed to create generator")
+                                    }
+                                    
+                                    generator.ensureLoaded()
+                                    guard var denoiser = (generator as? TextToImageGenerator)?.generateLatents(parameters: parameters) else {
+                                        throw Abort(.internalServerError, reason: "Failed to create denoiser")
+                                    }
+                                    
+                                    // Generate image
+                                    req.logger.info("Starting text-to-image generation...")
+                                    var step = 0
+                                    var lastXt: MLXArray!
+                                    
+                                    while let xt = denoiser.next() {
+                                        step += 1
+                                        let progress = calculateProgress(currentStep: step, totalSteps: parameters.numInferenceSteps)
+                                        await jobStorage.updateJob(
+                                            id: jobId,
+                                            status: .inProgress(progress: progress),
+                                            request: request
+                                        )
+                                        req.logger.info("Step \(step)/\(parameters.numInferenceSteps) - Progress: \(progress)%")
+                                        eval(xt)
+                                        lastXt = xt
+                                    }
+                                    
+                                    // Process generated image
+                                    req.logger.info("Processing generated image...")
+                                    let unpackedLatents = unpackLatents(lastXt, height: parameters.height, width: parameters.width)
+                                    let decoded = generator.decode(xt: unpackedLatents)
+                                    let imageData = decoded.squeezed()
+                                    let raster = (imageData * 255).asType(.uint8)
+                                    
+                                    // Create Image instance
+                                    generatedImage = Image(raster)
                                 }
                                 
-                                generator.ensureLoaded()
-                                guard var denoiser = (generator as? TextToImageGenerator)?.generateLatents(parameters: parameters) else {
-                                    throw Abort(.internalServerError, reason: "Failed to create denoiser")
-                                }
+                                // Save the generated image
+                                let imageName = jobId + ".png"
+                                let imagePath = imagesPath + imageName
                                 
-                                // Generate image
-                req.logger.info("Starting image generation...")
-                                var step = 0
-                                var lastXt: MLXArray!
+                                req.logger.info("Saving image to: \(imagePath)")
+                                try generatedImage.save(url: URL(fileURLWithPath: imagePath))
                                 
-                                while let xt = denoiser.next() {
-                                    step += 1
-                                    let progress = calculateProgress(currentStep: step, totalSteps: parameters.numInferenceSteps)
-                                    await jobStorage.updateJob(
-                                        id: jobId,
-                                        status: .inProgress(progress: progress),
-                                        request: request
-                                    )
-                                    req.logger.info("Step \(step)/\(parameters.numInferenceSteps) - Progress: \(progress)%")
-                                    eval(xt)
-                                    lastXt = xt
-                                }
-                                
-                // Process generated image
-                                req.logger.info("Processing generated image...")
-                                let unpackedLatents = unpackLatents(lastXt, height: parameters.height, width: parameters.width)
-                                let decoded = generator.decode(xt: unpackedLatents)
-                                let imageData = decoded.squeezed()
-                                let raster = (imageData * 255).asType(.uint8)
-                                
-                                // Create Image instance
-                                let image = Image(raster)
-                
-                // Save image
-                let imageName = jobId + ".png"
-                let imagePath = imagesPath + imageName
-                
-                req.logger.info("Saving image to: \(imagePath)")
-                try image.save(url: URL(fileURLWithPath: imagePath))
-                
-                req.logger.info("Image saved successfully")
-                await jobStorage.updateJob(
-                    id: jobId,
-                    status: .completed(imagePath: "images/" + imageName),
-                    request: request
-                )
+                                req.logger.info("Image saved successfully")
+                                await jobStorage.updateJob(
+                                    id: jobId,
+                                    status: .completed(imagePath: "images/" + imageName),
+                                    request: request
+                                )
                 
                 // Schedule cleanup
                 Task {
