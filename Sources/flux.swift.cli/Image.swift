@@ -1,3 +1,5 @@
+//Image.swift
+
 // copied from mlx-swift-mlx stable diffusion example https://github.com/ml-explore/mlx-swift-examples/blob/main/Libraries/StableDiffusion/Image.swift
 
 import CoreGraphics

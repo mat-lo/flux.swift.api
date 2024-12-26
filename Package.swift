@@ -11,6 +11,7 @@ let package = Package(
     .package(url: "https://github.com/apple/swift-async-algorithms", from: "1.0.0"),
     .package(url: "https://github.com/apple/swift-argument-parser", from: "1.5.0"),
     .package(url: "https://github.com/jkandzi/Progress.swift", from: "0.4.0"),
+    .package(url: "https://github.com/vapor/vapor.git", from: "4.76.0"),
   ],
   targets: [
     .executableTarget(
@@ -21,6 +22,33 @@ let package = Package(
         .product(name: "AsyncAlgorithms", package: "swift-async-algorithms"),
         .product(name: "ArgumentParser", package: "swift-argument-parser"),
         .product(name: "Progress", package: "Progress.swift"),
-      ])
+        .product(name: "Vapor", package: "vapor")
+      ],
+      linkerSettings: [
+        .linkedFramework("Metal"),
+        .linkedFramework("MetalKit"),
+        .linkedFramework("MetalPerformanceShaders"),
+        .linkedFramework("CoreML"),
+        .linkedFramework("Accelerate")
+      ]),
+    // New API target
+    .executableTarget(
+        name: "FluxAPI",
+        dependencies: [
+            .product(name: "FluxSwift", package: "flux.swift"),
+            .product(name: "Transformers", package: "swift-transformers"),
+            .product(name: "AsyncAlgorithms", package: "swift-async-algorithms"),
+            .product(name: "ArgumentParser", package: "swift-argument-parser"),
+            .product(name: "Progress", package: "Progress.swift"),
+            .product(name: "Vapor", package: "vapor")
+        ],
+        linkerSettings: [
+            .linkedFramework("Metal"),
+            .linkedFramework("MetalKit"),
+            .linkedFramework("MetalPerformanceShaders"),
+            .linkedFramework("CoreML"),
+            .linkedFramework("Accelerate")
+        ]
+    )
   ]
 )
