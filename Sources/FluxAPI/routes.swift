@@ -88,7 +88,6 @@ struct GenerateRequest: Content {
     var finalQuantize: Bool {
         return quantize ?? false // Default is false if not passed
     }
-    
 }
 
 struct JobResponse: Content {
@@ -141,11 +140,10 @@ actor JobStorage {
         jobs.removeValue(forKey: id)
     }
     
-    func deleteJob(id:String) {
+    func deleteJob(id: String) {
         jobs.removeValue(forKey: id)
     }
 }
-
 
 // MARK: - Helper Functions
 
@@ -170,7 +168,7 @@ private func unpackLatents(_ latents: MLXArray, height: Int, width: Int) -> MLXA
 func selectFluxConfiguration(modelType: String, hfToken: String?) -> FluxConfiguration {
     switch modelType {
     case "dev":
-      let token = hfToken
+        let token = hfToken
         return FluxConfiguration.flux1Dev
     case "schnell":
         return FluxConfiguration.flux1Schnell
@@ -247,16 +245,15 @@ func routes(_ app: Application) throws {
                 )
 
                 if let loraPath = loadConfiguration.loraPath {
-                  if !FileManager.default.fileExists(atPath: loraPath) {
-                    try await selectedModel.downloadLoraWeights(loadConfiguration: loadConfiguration) {
-                      progress in
+                    if !FileManager.default.fileExists(atPath: loraPath) {
+                        try await selectedModel.downloadLoraWeights(loadConfiguration: loadConfiguration) {
+                            _ in
                       
-                      req.logger.info("Downloading lora weights for \(loraPath) model...")
+                            req.logger.info("Downloading lora weights for \(loraPath) model...")
+                        }
                     }
-                  }
                 }
 
-                
                 // Set up generator and parameters
                 let parameters = EvaluateParameters(
                     width: request.finalWidth,
@@ -324,12 +321,12 @@ func routes(_ app: Application) throws {
                             request: request
                         )
                         req.logger.info("Step \(step)/\(parameters.numInferenceSteps) - Progress: \(progress)%")
-                         await jobStorage.updateJob(
-                             id: jobId,
-                             status: .inProgress(progress: progress),
-                             request: request
-                         )
-                         req.logger.info("Updated job \(jobId) to progress \(progress)")
+                        await jobStorage.updateJob(
+                            id: jobId,
+                            status: .inProgress(progress: progress),
+                            request: request
+                        )
+                        req.logger.info("Updated job \(jobId) to progress \(progress)")
                         eval(xt)
                         lastXt = xt
                     }
@@ -363,12 +360,12 @@ func routes(_ app: Application) throws {
                     while let xt = denoiser.next() {
                         step += 1
                         let progress = calculateProgress(currentStep: step, totalSteps: parameters.numInferenceSteps)
-                         await jobStorage.updateJob(
-                             id: jobId,
-                             status: .inProgress(progress: progress),
-                             request: request
-                         )
-                         req.logger.info("Updated job \(jobId) to progress \(progress)")
+                        await jobStorage.updateJob(
+                            id: jobId,
+                            status: .inProgress(progress: progress),
+                            request: request
+                        )
+                        req.logger.info("Updated job \(jobId) to progress \(progress)")
                         req.logger.info("Step \(step)/\(parameters.numInferenceSteps) - Progress: \(progress)%")
                         eval(xt)
                         lastXt = xt
@@ -399,8 +396,6 @@ func routes(_ app: Application) throws {
                     request: request
                 )
                 
-               
-                
             } catch {
                 req.logger.error("Error generating image: \(error)")
                 await jobStorage.updateJob(
@@ -424,13 +419,11 @@ func routes(_ app: Application) throws {
         req.logger.info("Requesting status for job: \(jobId)")
         
         guard let job = await jobStorage.getJob(id: jobId) else {
-             req.logger.info("Job \(jobId) not found in status check.")
-             throw Abort(.notFound, reason: "Job not found")
-            
+            req.logger.info("Job \(jobId) not found in status check.")
+            throw Abort(.notFound, reason: "Job not found")
         }
-          req.logger.info("Job \(jobId) status: \(job.status)")
+        req.logger.info("Job \(jobId) status: \(job.status)")
 
-        
         switch job.status {
         case .inProgress(let progress):
             return JobStatusResponse(
@@ -477,21 +470,19 @@ func routes(_ app: Application) throws {
         guard let jobId = req.parameters.get("jobId") else {
             throw Abort(.badRequest, reason: "Job ID is required")
         }
-         req.logger.info("Requesting download for job: \(jobId)")
+        req.logger.info("Requesting download for job: \(jobId)")
         
         guard let job = await jobStorage.getJob(id: jobId) else {
             req.logger.info("Job \(jobId) not found in download check.")
-             throw Abort(.notFound, reason: "Image not found or job not completed")
+            throw Abort(.notFound, reason: "Image not found or job not completed")
         }
         
-         guard case .completed(let imagePath) = job.status else {
-             throw Abort(.notFound, reason: "Image not found or job not completed")
+        guard case .completed(let imagePath) = job.status else {
+            throw Abort(.notFound, reason: "Image not found or job not completed")
         }
         
-        
-         req.logger.info("Job \(jobId) status at download check: \(job.status)")
+        req.logger.info("Job \(jobId) status at download check: \(job.status)")
 
-        
         let fullPath = publicPath + imagePath
         guard FileManager.default.fileExists(atPath: fullPath) else {
             throw Abort(.notFound, reason: "Image file not found")
@@ -504,8 +495,8 @@ func routes(_ app: Application) throws {
         response.body = .init(data: data)
         
         // Clean the job only after the file was delivered.
-         await jobStorage.deleteJob(id: jobId)
-         try? FileManager.default.removeItem(atPath: fullPath)
+        await jobStorage.deleteJob(id: jobId)
+        try? FileManager.default.removeItem(atPath: fullPath)
         
         return response
     }
