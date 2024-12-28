@@ -1,3 +1,5 @@
+// routes.swift
+
 import CoreGraphics
 import FluxSwift
 import Foundation
@@ -12,7 +14,6 @@ import UniformTypeIdentifiers
 import Vapor
 
 // MARK: - CORS Configuration
-
 public func configureCORS(_ app: Application) throws {
     // Configure CORS middleware
     let corsConfiguration = CORSMiddleware.Configuration(
@@ -52,6 +53,7 @@ struct GenerateRequest: Content {
     var hfToken: String?
     var loraPath: String?
     var initImagePath: String?
+    var initImageBase64: String?
     var initImageStrength: Float?
     
     // Helper properties with validation
@@ -217,8 +219,27 @@ func routes(_ app: Application) throws {
     // MARK: Generate endpoint
     
     app.post("generate") { req async throws -> JobResponse in
-        let request = try req.content.decode(GenerateRequest.self)
+        var request = try req.content.decode(GenerateRequest.self)
         let jobId = UUID().uuidString
+        
+        // Handle base64 image if provided
+        if let base64Str = request.initImageBase64 {
+            // Strip data URI prefix if present
+            let dataURIPrefixPattern = "^data:image\\/\\w+;base64,"
+            if let range = base64Str.range(of: dataURIPrefixPattern, options: .regularExpression) {
+                request.initImageBase64 = String(base64Str[range.upperBound...])
+            }
+            
+            // Decode base64 and save to temp file
+            if let imageData = Data(base64Encoded: request.initImageBase64 ?? "") {
+                let tmpInitFileName = "tmp_\(jobId).png"
+                let tmpInitFullPath = imagesPath + tmpInitFileName
+                
+                try imageData.write(to: URL(fileURLWithPath: tmpInitFullPath))
+                request.initImagePath = tmpInitFullPath
+                req.logger.info("Received base64 init image; wrote to \(tmpInitFullPath)")
+            }
+        }
         
         req.logger.info("Received request: prompt='\(request.prompt ?? "default prompt")', width=\(request.finalWidth), height=\(request.finalHeight), steps=\(request.finalSteps), model=\(request.finalModel)")
         
@@ -396,7 +417,24 @@ func routes(_ app: Application) throws {
                     request: request
                 )
                 
+                // Clean up temporary init image after successful generation
+                if let tmpPath = request.initImagePath,
+                   tmpPath.contains("tmp_\(jobId).png"),
+                   FileManager.default.fileExists(atPath: tmpPath)
+                {
+                    try? FileManager.default.removeItem(atPath: tmpPath)
+                    req.logger.info("Cleaned up temporary init image at \(tmpPath)")
+                }
+                
             } catch {
+                // Clean up temporary file in case of error too
+                if let tmpPath = request.initImagePath,
+                   tmpPath.contains("tmp_\(jobId).png"),
+                   FileManager.default.fileExists(atPath: tmpPath)
+                {
+                    try? FileManager.default.removeItem(atPath: tmpPath)
+                    req.logger.info("Cleaned up temporary init image after error at \(tmpPath)")
+                }
                 req.logger.error("Error generating image: \(error)")
                 await jobStorage.updateJob(
                     id: jobId,
